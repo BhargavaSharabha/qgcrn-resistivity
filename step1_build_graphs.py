@@ -1,18 +1,14 @@
 """
-Step 1 — Build PTE graphs for DPHI and GRD features.
+Step 1 — Build PTE graphs for DPHI and GRD features (PARALLELISED).
 
-For each feature (DPHI, GRD):
+For each feature (DPHI, GRD, ILD):
   1. Pivot raw CSV → (142 wells × N_depth) matrices
   2. Compute real pTE matrix (142 × 142) using IAAFT surrogates
   3. Build directed edge list: real_pTE[i→j] > max(surrogate_pTE[i→j])
   4. Save edge_index + edge_attr as .npy files
 
-Output files (graph_data/)
-  well_ids.npy              — ordered list of 142 well IDs
-  {dphi,grd,ild}_pte_real.npy     — full pTE matrices (142×142)
-  {dphi,grd,ild}_pte_iaaft.npy   — surrogate pTE matrices
-  edge_index_{dphi,grd,ild}.npy  — (2, E) source/dest node indices
-  edge_attr_{dphi,grd,ild}.npy   — (E,) edge weights (real pTE values)
+PARALLELISM: uses ALL CPU cores via joblib (N_JOBS=-1).
+  On 18-core machine: ~10-15x faster than single-threaded.
 
 Usage:
   python step1_build_graphs.py
@@ -21,9 +17,9 @@ Usage:
 import os
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+import time
 
-from pte import pTE
+from pte import pte_parallel
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,13 +27,25 @@ DATA_CSV = os.path.join(BASE_DIR, "aligned_wells.csv")
 OUT_DIR  = os.path.join(BASE_DIR, "graph_data")
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# ── Settings ────────────────────────────────────────────────────────────────
+N_JOBS   = -1          # -1 = all CPU cores; set e.g. 8 to limit
+TAU      = 1
+DIM_EMB  = 1
+NSURR    = 19          # IAAFT surrogates per pair
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def compute_pte(mat, feature_name, tau=1, dimEmb=1, Nsurr=19):
-    """Compute real + IAAFT surrogate pTE matrix; apply post-processing."""
-    print(f"\n  Computing pTE for {feature_name}  shape={mat.shape} …")
-    pte, pte_surr = pTE(mat, tau=tau, dimEmb=dimEmb, surr='iaaft', Nsurr=Nsurr)
+def compute_pte(mat, feature_name):
+    """Compute real + IAAFT surrogate pTE matrix using all CPU cores."""
+    t = time.time()
+    pte, pte_surr = pte_parallel(
+        mat,
+        tau=TAU,
+        dimEmb=DIM_EMB,
+        surr='iaaft',
+        Nsurr=NSURR,
+        n_jobs=N_JOBS,
+    )
 
     # Post-processing (from original notebook)
     np.fill_diagonal(pte, 0)
@@ -46,6 +54,9 @@ def compute_pte(mat, feature_name, tau=1, dimEmb=1, Nsurr=19):
     pte_surr[~np.isfinite(pte_surr)] = 0
     pte[pte < 0] = 0
     pte_surr[pte_surr < 0] = 0
+
+    elapsed = time.time() - t
+    print(f"    Done in {elapsed:.1f}s")
     return pte, pte_surr
 
 
@@ -77,8 +88,13 @@ def build_edges(real_pte, surr_pte):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    import joblib
+    print(f"\n  joblib version: {joblib.__version__}")
+    print(f"  N_JOBS = {N_JOBS}  (all cores)" if N_JOBS == -1 else f"  N_JOBS = {N_JOBS}")
+
+    t0 = time.time()
     print("=" * 60)
-    print("STEP 1 — Build PTE Graphs")
+    print("STEP 1 — Build PTE Graphs  (FULLY PARALLELISED)")
     print("=" * 60)
 
     # 1. Load & pivot
@@ -111,6 +127,8 @@ def main():
     ]
 
     for mat, name in results:
+        t1 = time.time()
+        print(f"\n  ── {name.upper()} ──")
         pte, pte_surr = compute_pte(mat, name.upper())
 
         # Save full matrices
@@ -124,15 +142,19 @@ def main():
 
         n_edges = edge_index.shape[1]
         density = n_edges / (n_wells * (n_wells - 1))
-        print(f"  {name.upper()} graph → {n_edges} edges  density={density:.4f}")
+        elapsed = time.time() - t1
+        print(f"  {name.upper()} graph → {n_edges} edges  density={density:.4f}  "
+              f"total: {elapsed:.1f}s")
 
     # 3. Summary
+    total = time.time() - t0
     print(f"\n[4/4] Files saved to  {OUT_DIR}/")
     for f in sorted(os.listdir(OUT_DIR)):
         sz = os.path.getsize(os.path.join(OUT_DIR, f)) / 1024
         print(f"   {f:<45s}  {sz:7.1f} KB")
 
-    print("\n✓ Step 1 complete — run Step 2:  python step2_qgcrn_model.py")
+    print(f"\n✓ Step 1 complete — total time: {total:.1f}s")
+    print("\n  Run Step 2:  python step2_qgcrn_model.py")
 
 
 if __name__ == "__main__":
